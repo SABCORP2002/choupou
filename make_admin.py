@@ -1,72 +1,72 @@
-"""
-Script pour promouvoir un utilisateur en admin
-"""
+from __future__ import annotations
+
+import argparse
 import sqlite3
-import os
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'waste.db')
+from config import settings
 
-def list_users():
-    """Afficher tous les utilisateurs"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT id, email, role FROM users')
-    users = c.fetchall()
-    conn.close()
-    
-    print("\n=== Liste des utilisateurs ===")
-    if not users:
-        print("Aucun utilisateur trouvé.")
-        return []
-    
-    for user in users:
-        role_display = "👑 ADMIN" if user[2] == 'admin' else "👤 user"
-        print(f"  ID: {user[0]} | Email: {user[1]} | Rôle: {role_display}")
-    
-    return users
+DB_PATH = Path(settings.db_path)
 
-def make_admin(email):
-    """Promouvoir un utilisateur en admin"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Vérifier si l'utilisateur existe
-    c.execute('SELECT id, role FROM users WHERE email = ?', (email,))
-    user = c.fetchone()
-    
-    if not user:
-        print(f"❌ Aucun utilisateur trouvé avec l'email: {email}")
+
+def list_users() -> list:
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, email, role FROM users ORDER BY id ASC")
+        return c.fetchall()
+    finally:
         conn.close()
-        return False
-    
-    if user[1] == 'admin':
-        print(f"ℹ️ L'utilisateur {email} est déjà admin.")
-        conn.close()
+
+
+def make_admin(email: str) -> bool:
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, role FROM users WHERE email = ?", (email,))
+        user = c.fetchone()
+        if not user:
+            print(f"[ERREUR] Aucun utilisateur avec email={email}")
+            return False
+
+        if user[1] == "admin":
+            print(f"[OK] {email} est deja admin.")
+            return True
+
+        c.execute("UPDATE users SET role = ? WHERE email = ?", ("admin", email))
+        conn.commit()
+        print(f"[OK] {email} est maintenant admin.")
         return True
-    
-    # Mettre à jour le rôle
-    c.execute('UPDATE users SET role = ? WHERE email = ?', ('admin', email))
-    conn.commit()
-    conn.close()
-    
-    print(f"✅ L'utilisateur {email} est maintenant ADMIN !")
-    return True
+    finally:
+        conn.close()
 
-if __name__ == '__main__':
-    print("=" * 50)
-    print("  OUTIL DE GESTION ADMIN - WasteAI")
-    print("=" * 50)
-    
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Promouvoir un utilisateur en admin.")
+    parser.add_argument("--email", help="Email de l'utilisateur a promouvoir.")
+    args = parser.parse_args()
+
+    if not DB_PATH.exists():
+        print(f"[ERREUR] Base SQLite introuvable: {DB_PATH}")
+        return 1
+
     users = list_users()
-    
-    if users:
-        print("\n")
-        email = input("Entrez l'email de l'utilisateur à promouvoir en admin: ").strip()
-        
-        if email:
-            make_admin(email)
-        else:
-            print("❌ Email vide, opération annulée.")
-    
-    print("\n")
-    input("Appuyez sur Entrée pour fermer...")
+    if not users:
+        print("[INFO] Aucun utilisateur en base.")
+        return 0
+
+    print("=== Utilisateurs ===")
+    for user in users:
+        print(f"- id={user[0]} email={user[1]} role={user[2]}")
+
+    email = args.email
+    if not email:
+        email = input("Email a promouvoir admin: ").strip()
+    if not email:
+        print("[ERREUR] Email vide.")
+        return 2
+    return 0 if make_admin(email) else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

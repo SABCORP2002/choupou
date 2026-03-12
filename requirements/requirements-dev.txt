@@ -1,0 +1,11 @@
+-r requirements-base.txt
+
+# Required only for .pt inference/export (heavier stack).
+ultralytics>=8.2,<9.0
+torch>=2.1,<2.7; platform_machine == "x86_64" or platform_machine == "AMD64" or platform_machine == "aarch64"
+
+# Optional PDF export support.
+reportlab>=4.0,<5.0
+
+# Dev tooling.
+pytest>=8.0,<9.0

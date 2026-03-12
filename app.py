@@ -1,40 +1,70 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, Response,send_file
+from flask import Flask, render_template, request, jsonify, session, redirect, Response, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
+from pathlib import Path
+import io
+import os
 import sqlite3
+import tempfile
 import uuid
 from datetime import datetime, timedelta
 from functools import wraps
-import os
 import cv2
 import numpy as np
-from yolo_detector import WasteDetector
-from ultralytics import YOLO
 
-app = Flask(__name__)
-app.secret_key = 'your-secret-key-wasteai'
-
-# Chemin de la base de données
-DB_PATH = os.path.join(os.path.dirname(__file__), 'waste.db')
-
-# Initialiser le détecteur YOLO
 try:
-    YOLO_DETECTOR = WasteDetector('my_model.pt')
-    print("✅ Modèle YOLO personnalisé (my_model.pt) chargé avec succès")
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+from config import settings
+from detector.camera import CameraSource
+from yolo_detector import WasteDetector
+
+app = Flask(
+    __name__,
+    template_folder=str(settings.templates_dir),
+    static_folder=str(settings.static_dir),
+)
+app.secret_key = settings.secret_key
+
+# Chemin de la base de donnees
+DB_PATH = str(settings.db_path)
+
+# Initialiser le detecteur
+try:
+    YOLO_DETECTOR = WasteDetector(backend=settings.backend, db_path=DB_PATH)
+    if YOLO_DETECTOR.is_ready():
+        print(f"Detecteur initialise avec backend={YOLO_DETECTOR.backend_name}")
+    else:
+        print(f"Detecteur indisponible: {YOLO_DETECTOR.last_error}")
 except Exception as e:
-    print(f"⚠️ Erreur chargement YOLO: {e}")
+    print(f"Erreur chargement detecteur: {e}")
     YOLO_DETECTOR = None
 
-# Variable globale pour la caméra
+# Variable globale pour la camera
 camera = None
 detection_buffer = {}  # Buffer pour accumuler les détections
 frame_count = 0  # Compteur de frames
 SAVE_INTERVAL = 10  # Sauvegarder toutes les 10 frames
 
-def get_camera():
+def load_yolo():
+    global YOLO_DETECTOR
+    if YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
+        return True
+    YOLO_DETECTOR = WasteDetector(backend=settings.backend, db_path=DB_PATH)
+    return YOLO_DETECTOR.is_ready()
+
+def get_camera() -> CameraSource:
     global camera
     if camera is None:
-        camera = cv2.VideoCapture(0)
+        source = CameraSource(mode=settings.camera_mode, camera_index=settings.camera_index)
+        if not source.open():
+            raise RuntimeError(
+                "Impossible d'ouvrir la camera. "
+                "Verifiez WASTEAI_CAMERA_MODE/WASTEAI_CAMERA_INDEX."
+            )
+        camera = source
     return camera
 
 def release_camera():
@@ -212,8 +242,9 @@ def logout():
 # ==================== ROUTES PROFIL ====================
 
 # Configuration upload
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'profiles')
+UPLOAD_FOLDER = str(settings.upload_dir)
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -229,14 +260,6 @@ def logout_user():
     """Déconnexion de l'utilisateur"""
     session.clear()
     return redirect('/login')
-
-@app.route('/api/logout', methods=['POST'])
-def api_logout():
-    """API de déconnexion"""
-    session.clear()
-    return jsonify({'success': True})
-
-
 
 @app.route('/api/profile', methods=['GET'])
 @login_required
@@ -350,7 +373,13 @@ def upload_profile_picture():
         old_picture = c.fetchone()
         
         if old_picture and old_picture[0]:
-            old_path = os.path.join(os.path.dirname(__file__), 'static', old_picture[0].lstrip('/static/'))
+            static_prefix = '/static/'
+            stored_path = old_picture[0]
+            if stored_path.startswith(static_prefix):
+                relative_path = stored_path[len(static_prefix):]
+            else:
+                relative_path = stored_path.lstrip('/')
+            old_path = os.path.join(str(settings.static_dir), relative_path)
             if os.path.exists(old_path):
                 try:
                     os.remove(old_path)
@@ -433,19 +462,31 @@ def add_waste_detection():
 def camera_page():
     return render_template('camera.html', email=session.get('email'))
 
-def gen_frames():
+def gen_frames(user_id=None):
     global frame_count, detection_buffer
     
-    cam = get_camera()
-    if not cam.isOpened():
-        print("❌ Caméra non accessible (isOpened=False)")
+    try:
+        cam = get_camera()
+    except RuntimeError as exc:
+        error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(error_frame, "CAMERA INDISPONIBLE", (40, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(error_frame, str(exc)[:65], (20, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
+        ret, buffer = cv2.imencode('.jpg', error_frame)
+        if ret:
+            frame = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        return
+
+    if not cam.is_opened():
+        print("Camera non accessible (is_opened=False)")
     else:
-        print("📸 Flux caméra démarré")
+        print("Flux camera demarre")
 
     while True:
         success, frame = cam.read()
         if not success:
-            print("❌ Echec lecture frame caméra")
+            print("Echec lecture frame camera")
             # Générer une image d'erreur
             error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(error_frame, "ERREUR CAMERA", (50, 240), 
@@ -458,7 +499,7 @@ def gen_frames():
         else:
             # Detection YOLO si disponible
             detections_summary = {}
-            if YOLO_DETECTOR:
+            if YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
                 frame, detections_summary = YOLO_DETECTOR.detect_from_frame(frame)
                 
                 # Accumuler les détections dans le buffer
@@ -472,13 +513,12 @@ def gen_frames():
             frame_count += 1
             if frame_count >= SAVE_INTERVAL and detection_buffer:
                 # Sauvegarder dans la BD
-                user_id = session.get('user_id')
-                if user_id and YOLO_DETECTOR:
+                if user_id and YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
                     try:
                         YOLO_DETECTOR.save_detections_to_db(user_id, detection_buffer)
-                        print(f"✅ Détections sauvegardées: {detection_buffer}")
+                        print(f"Detections sauvegardees: {detection_buffer}")
                     except Exception as e:
-                        print(f"❌ Erreur sauvegarde détections: {e}")
+                        print(f"Erreur sauvegarde detections: {e}")
                 
                 # Réinitialiser le buffer et le compteur
                 detection_buffer = {}
@@ -492,7 +532,8 @@ def gen_frames():
 @app.route('/video_feed')
 @login_required
 def video_feed():
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    user_id = session.get('user_id')
+    return Response(gen_frames(user_id=user_id), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/api/robot/status', methods=['GET'])
 @login_required
@@ -529,7 +570,10 @@ def toggle_camera_route():
     action = data.get('action')
     
     if action == 'start':
-        get_camera()
+        try:
+            get_camera()
+        except RuntimeError as exc:
+            return jsonify({'success': False, 'message': str(exc)}), 500
         # Réinitialiser le buffer et le compteur au démarrage
         detection_buffer = {}
         frame_count = 0
@@ -537,12 +581,12 @@ def toggle_camera_route():
         release_camera()
         # Sauvegarder les détections restantes avant d'arrêter
         user_id = session.get('user_id')
-        if user_id and detection_buffer and YOLO_DETECTOR:
+        if user_id and detection_buffer and YOLO_DETECTOR and YOLO_DETECTOR.is_ready():
             try:
                 YOLO_DETECTOR.save_detections_to_db(user_id, detection_buffer)
-                print(f"✅ Détections finales sauvegardées: {detection_buffer}")
+                print(f"Detections finales sauvegardees: {detection_buffer}")
             except Exception as e:
-                print(f"❌ Erreur sauvegarde détections finales: {e}")
+                print(f"Erreur sauvegarde detections finales: {e}")
         detection_buffer = {}
         frame_count = 0
     
@@ -721,7 +765,10 @@ def record_batch_detection():
 @login_required
 def yolo_detect():
     """Page de détection YOLO"""
-    return render_template('yolo_detect.html', email=session.get('email'))
+    yolo_template = settings.templates_dir / 'yolo_detect.html'
+    if yolo_template.exists():
+        return render_template('yolo_detect.html', email=session.get('email'))
+    return redirect('/camera')
 
 @app.route('/api/yolo/detect-image', methods=['POST'])
 @login_required
@@ -731,7 +778,8 @@ def yolo_detect_image():
     
     # Charger YOLO
     if not load_yolo():
-        return jsonify({'success': False, 'message': 'Modèle YOLO non disponible'}), 500
+        details = YOLO_DETECTOR.last_error if YOLO_DETECTOR else "Detecteur non initialise"
+        return jsonify({'success': False, 'message': f'Modele YOLO non disponible: {details}'}), 500
     
     if 'file' not in request.files:
         return jsonify({'success': False, 'message': 'Aucun fichier uploadé'}), 400
@@ -741,16 +789,24 @@ def yolo_detect_image():
     if file.filename == '':
         return jsonify({'success': False, 'message': 'Fichier vide'}), 400
     
+    temp_path = None
     try:
-        # Sauvegarder le fichier temporairement
-        temp_path = f'temp_{datetime.now().timestamp()}.jpg'
+        # Sauvegarder le fichier temporairement dans le dossier du projet
+        suffix = Path(file.filename).suffix if file.filename else '.jpg'
+        with tempfile.NamedTemporaryFile(
+            mode='wb',
+            suffix=suffix or '.jpg',
+            prefix='upload_',
+            dir=str(settings.base_dir),
+            delete=False,
+        ) as tmp:
+            temp_path = tmp.name
         file.save(temp_path)
         
         # Détection
-        detections, results = YOLO_DETECTOR.detect_from_image(temp_path)
-        
-        # Nettoyer
-        os.remove(temp_path)
+        detections, details = YOLO_DETECTOR.detect_from_image(temp_path)
+        if detections is None:
+            return jsonify({'success': False, 'message': str(details)}), 500
         
         if detections:
             # Résumer les détections
@@ -777,29 +833,32 @@ def yolo_detect_image():
     
     except Exception as e:
         return jsonify({'success': False, 'message': f'Erreur: {str(e)}'}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 @app.route("/predict", methods=['POST'])
 def predict():
+    if not load_yolo():
+        details = YOLO_DETECTOR.last_error if YOLO_DETECTOR else "Detecteur non initialise"
+        return jsonify({'success': False, 'message': f'Modele YOLO non disponible: {details}'}), 500
+
     if 'image' not in request.files:
         return "No image found", 400
     
     file = request.files['image']
-    image = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)    
-    
-    results = model(image)
-    names = results[0].names
-    bboxes = results[0].boxes    
-    
-    for box in bboxes:
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        label = names[int(box.cls[0])]
-        confidence = box.conf[0]        
-        
-        cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-        cv2.putText(image, f"{label} {confidence:.2f}", (int(x1), int(y1)-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    image = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return jsonify({'success': False, 'message': 'Image invalide'}), 400
 
-    _, img_encoded = cv2.imencode(".jpg", image)    
+    image, _ = YOLO_DETECTOR.detect_from_frame(image)
+    ok, img_encoded = cv2.imencode(".jpg", image)
+    if not ok:
+        return jsonify({'success': False, 'message': "Echec d'encodage image"}), 500
+
     return send_file(io.BytesIO(img_encoded.tobytes()), mimetype="image/jpeg")
 
 @app.route('/api/yolo/detect-webcam', methods=['POST'])
@@ -811,8 +870,9 @@ def yolo_detect_webcam():
     duration = data.get('duration', 10)
     save_to_db = data.get('save_to_db', True)
     
-    if not YOLO_DETECTOR:
-        return jsonify({'success': False, 'message': 'Modèle YOLO non disponible'}), 500
+    if not load_yolo():
+        details = YOLO_DETECTOR.last_error if YOLO_DETECTOR else "Detecteur non initialise"
+        return jsonify({'success': False, 'message': f'Modele YOLO non disponible: {details}'}), 500
     
     try:
         # Détection webcam
@@ -1472,4 +1532,9 @@ def test_api():
     return render_template('test_api.html')
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    app.run(
+        host=settings.flask_host,
+        port=settings.flask_port,
+        debug=settings.flask_debug,
+    )

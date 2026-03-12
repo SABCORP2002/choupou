@@ -1,39 +1,77 @@
-import onnxruntime as ort
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
+from __future__ import annotations
 
-session = ort.InferenceSession("yolov8m.onnx", providers=["CPUExecutionProvider"])
-input_name = session.get_inputs()[0].name
+import argparse
+from pathlib import Path
 
-img = cv2.imread("test.jpg")
-img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+from config import settings
 
-img_resized = cv2.resize(img_rgb, (640, 640))
-img_norm = img_resized / 255.0
-img_tensor = np.transpose(img_norm, (2, 0, 1))[None].astype(np.float32)
 
-outputs = session.run(None, {input_name: img_tensor})
-preds = outputs[0][0].T
+def default_image() -> Path:
+    img = settings.base_dir / "test.jpg"
+    if img.exists():
+        return img
+    raise FileNotFoundError("Image de test introuvable: ajoutez test.jpg a la racine.")
 
-scores = preds[:, 4:].max(axis=1)
-classes = preds[:, 4:].argmax(axis=1)
-boxes = preds[:, :4]
 
-mask = scores > 0.4
-boxes, scores, classes = boxes[mask], scores[mask], classes[mask]
+def main() -> int:
+    try:
+        from detector.detector_backend import choose_backend
+    except Exception as exc:
+        print(f"[ERREUR] Import backend ONNX impossible: {exc}")
+        return 1
 
-h, w, _ = img.shape
-for box, score, cls in zip(boxes, scores, classes):
-    cx, cy, bw, bh = box
-    x1 = int((cx - bw/2) * w / 640)
-    y1 = int((cy - bh/2) * h / 640)
-    x2 = int((cx + bw/2) * w / 640)
-    y2 = int((cy + bh/2) * h / 640)
+    parser = argparse.ArgumentParser(description="Test d'inference ONNX CPU.")
+    parser.add_argument("--image", type=Path, help="Image a tester.")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=settings.onnx_model,
+        help="Chemin du modele ONNX (defaut: models/my_model.onnx).",
+    )
+    args = parser.parse_args()
 
-    cv2.rectangle(img_rgb, (x1, y1), (x2, y2), (0,255,0), 2)
-    cv2.putText(img_rgb, f"{cls}:{score:.2f}", (x1, y1-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+    model_path = args.model if args.model.is_absolute() else (settings.base_dir / args.model)
+    image_path = args.image or default_image()
+    if not image_path.is_absolute():
+        image_path = (settings.base_dir / image_path).resolve()
 
-plt.imshow(img_rgb)
-plt.axis("off")
+    backend, error = choose_backend(
+        requested_backend="onnx",
+        confidence=settings.confidence_threshold,
+        class_map=settings.waste_classes,
+        onnx_model=model_path,
+        pt_candidates=settings.pt_candidates,
+    )
+    if backend is None:
+        print(f"[ERREUR] Backend ONNX indisponible: {error}")
+        return 2
+
+    try:
+        import cv2
+    except ImportError as exc:
+        print(f"[ERREUR] OpenCV manquant: {exc}")
+        return 4
+
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        print(f"[ERREUR] Impossible de lire l'image: {image_path}")
+        return 3
+
+    detections = backend.detect(frame)
+    print(f"[OK] Modele ONNX: {model_path}")
+    print(f"[OK] Image: {image_path}")
+    print(f"[OK] Detections: {len(detections)}")
+    for idx, det in enumerate(detections, start=1):
+        print(f"  {idx}. {det.label} | conf={det.confidence:.3f} | box={det.box_xyxy}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except FileNotFoundError as exc:
+        print(f"[ERREUR] {exc}")
+        raise SystemExit(1)
+    except Exception as exc:
+        print(f"[ERREUR] Test ONNX echoue: {exc}")
+        raise SystemExit(1)

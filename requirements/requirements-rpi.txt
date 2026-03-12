@@ -1,0 +1,4 @@
+-r requirements-base.txt
+
+# Pi camera support is generally installed via apt on Raspberry Pi OS:
+# sudo apt install -y python3-picamera2
